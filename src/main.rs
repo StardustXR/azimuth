@@ -7,13 +7,16 @@ use serde::{Deserialize, Serialize};
 use stardust_xr_fusion::{
 	client::{Client, FrameInfo, RootHandler},
 	core::{schemas::flex::flexbuffers, values::Transform},
+	data::{NewReceiverInfo, PulseReceiver, PulseSender, PulseSenderHandler},
 	drawable::Lines,
-	fields::{Field, RayMarchResult, SphereField},
-	input::{InputHandler, PointerInputMethod},
+	fields::{Field, RayMarchResult, SphereField, UnknownField},
+	input::{InputHandler, InputMethod, PointerInputMethod},
 	node::NodeType,
+	HandlerWrapper,
 };
 use stardust_xr_molecules::{
 	data::InlinePulseReceiver,
+	keyboard::{KeyboardEvent, KEYBOARD_MASK},
 	lines::{circle, make_line_points},
 	mouse::{MouseEvent as MouseReceiverEvent, MOUSE_MASK},
 };
@@ -27,7 +30,8 @@ async fn main() -> Result<()> {
 		.expect("Couldn't connect");
 
 	let (mouse_event_tx, mouse_event_rx) = tokio::sync::mpsc::channel(64);
-	let azimuth = client.wrap_root(Azimuth::create(&client, mouse_event_rx)?)?;
+	let (keyboard_event_tx, keyboard_event_rx) = tokio::sync::mpsc::channel(64);
+	let azimuth = client.wrap_root(Azimuth::create(&client, mouse_event_rx, keyboard_event_rx)?)?;
 	let field = SphereField::create(&azimuth.lock().pointer, [0.0; 3], 0.0)?;
 	let _mouse_pulse_receiver = InlinePulseReceiver::create(
 		&azimuth.lock().pointer,
@@ -77,6 +81,17 @@ async fn main() -> Result<()> {
 		},
 	)?;
 
+	let _keyboard_pulse_receiver = InlinePulseReceiver::create(
+		&azimuth.lock().pointer,
+		Transform::default(),
+		&field,
+		&KEYBOARD_MASK,
+		move |_uid, raw, _reader| {
+			let Some(key_event) = KeyboardEvent::from_pulse_data(raw) else {return};
+			let _ = keyboard_event_tx.try_send(key_event);
+		},
+	)?;
+
 	tokio::select! {
 		biased;
 		_ = tokio::signal::ctrl_c() => Ok(()),
@@ -111,13 +126,19 @@ const MOUSE_SENSITIVITY: f32 = 0.1;
 struct Azimuth {
 	pointer: PointerInputMethod,
 	mouse_event_rx: Receiver<MouseEvent>,
+	keyboard_event_rx: Receiver<KeyboardEvent>,
+	keyboard_pulse_sender: HandlerWrapper<PulseSender, DummyHandler>,
 	_lines: Lines,
 	yaw: f32,
 	pitch: f32,
 	datamap: Datamap,
 }
 impl Azimuth {
-	pub fn create(client: &Client, mouse_event_rx: Receiver<MouseEvent>) -> Result<Self> {
+	pub fn create(
+		client: &Client,
+		mouse_event_rx: Receiver<MouseEvent>,
+		keyboard_event_rx: Receiver<KeyboardEvent>,
+	) -> Result<Self> {
 		let pointer = PointerInputMethod::create(client.get_root(), Transform::identity(), None)?;
 		let line_points =
 			make_line_points(&circle(8, 0.0, 0.0005), 0.001, rgba!(1.0, 1.0, 1.0, 1.0));
@@ -127,10 +148,15 @@ impl Azimuth {
 			&line_points,
 			true,
 		)?;
+		let keyboard_pulse_sender =
+			PulseSender::create(&pointer, Transform::identity(), &KEYBOARD_MASK)?
+				.wrap(DummyHandler)?;
 
 		Ok(Azimuth {
 			pointer,
 			mouse_event_rx,
+			keyboard_event_rx,
+			keyboard_pulse_sender,
 			_lines: lines,
 			yaw: 0.0,
 			pitch: 0.0,
@@ -141,35 +167,8 @@ impl Azimuth {
 			},
 		})
 	}
-}
-impl RootHandler for Azimuth {
-	fn frame(&mut self, _info: FrameInfo) {
-		let Ok(client) = self.pointer.client() else {return};
-		let _ = self.pointer.set_position(Some(client.get_hmd()), [0.0; 3]);
 
-		self.datamap.scroll = [0.0; 2].into();
-		while let Ok(mouse_event) = self.mouse_event_rx.try_recv() {
-			match mouse_event {
-				MouseEvent::Moved { x, y } => {
-					self.yaw += x * MOUSE_SENSITIVITY;
-					self.pitch += y * MOUSE_SENSITIVITY;
-					self.pitch = self.pitch.clamp(-90.0, 90.0);
-
-					let rotation_x = Quat::from_rotation_x(-self.pitch.to_radians());
-					let rotation_y = Quat::from_rotation_y(-self.yaw.to_radians());
-					let _ = self.pointer.set_rotation(None, rotation_y * rotation_x);
-				}
-				MouseEvent::LeftClick(c) => self.datamap.select = if c { 1.0 } else { 0.0 },
-				MouseEvent::RightClick(c) => self.datamap.grab = if c { 1.0 } else { 0.0 },
-				MouseEvent::Scroll { x, y } => self.datamap.scroll = [x, y].into(),
-				MouseEvent::ScrollDiscrete { x, y } => self.datamap.scroll = [x, y].into(),
-			}
-		}
-		let _ = self
-			.pointer
-			.set_datamap(self.datamap.serialize_pulse_data().as_slice());
-
-		let pointer = self.pointer.alias();
+	fn handle_pointer_hit(pointer: InputMethod) {
 		tokio::task::spawn(async move {
 			let mut closest_hits: Option<(Vec<InputHandler>, RayMarchResult)> = None;
 			let mut join = JoinSet::new();
@@ -205,4 +204,93 @@ impl RootHandler for Azimuth {
 			}
 		});
 	}
+	fn handle_keyboard_send(
+		pointer: InputMethod,
+		keyboard_sender: PulseSender,
+		keyboard_events: Vec<KeyboardEvent>,
+	) {
+		tokio::task::spawn(async move {
+			let mut closest_hit: Option<(PulseReceiver, RayMarchResult)> = None;
+			let mut join = JoinSet::new();
+			for (receiver, field) in keyboard_sender.receivers().values() {
+				let Ok(ray_march_result) = field.ray_march(&pointer, [0.0; 3], [0.0, 0.0, -1.0]) else {continue};
+				let receiver = receiver.alias();
+				join.spawn(async move { (receiver, ray_march_result.await) });
+			}
+
+			while let Some(res) = join.join_next().await {
+				let Ok((receiver, Ok(ray_info))) = res else {continue};
+				if !ray_info.hit() || ray_info.deepest_point_distance <= 0.001 {
+					continue;
+				}
+				if let Some((hit_receiver, hit_info)) = &mut closest_hit {
+					if ray_info.deepest_point_distance < hit_info.deepest_point_distance {
+						*hit_receiver = receiver;
+						*hit_info = ray_info;
+					}
+				} else {
+					closest_hit.replace((receiver, ray_info));
+				}
+			}
+
+			let Some((hit_receiver, _hit_info)) = closest_hit else {return};
+			for key_event in keyboard_events {
+				let _ = key_event.send_event(&keyboard_sender, &[&hit_receiver]);
+			}
+		});
+	}
+}
+impl RootHandler for Azimuth {
+	fn frame(&mut self, _info: FrameInfo) {
+		let Ok(client) = self.pointer.client() else {return};
+		let _ = self.pointer.set_position(Some(client.get_hmd()), [0.0; 3]);
+
+		self.datamap.scroll = [0.0; 2].into();
+		while let Ok(mouse_event) = self.mouse_event_rx.try_recv() {
+			match mouse_event {
+				MouseEvent::Moved { x, y } => {
+					self.yaw += x * MOUSE_SENSITIVITY;
+					self.pitch += y * MOUSE_SENSITIVITY;
+					self.pitch = self.pitch.clamp(-90.0, 90.0);
+
+					let rotation_x = Quat::from_rotation_x(-self.pitch.to_radians());
+					let rotation_y = Quat::from_rotation_y(-self.yaw.to_radians());
+					let _ = self.pointer.set_rotation(None, rotation_y * rotation_x);
+				}
+				MouseEvent::LeftClick(c) => self.datamap.select = if c { 1.0 } else { 0.0 },
+				MouseEvent::RightClick(c) => self.datamap.grab = if c { 1.0 } else { 0.0 },
+				MouseEvent::Scroll { x, y } => self.datamap.scroll = [x, y].into(),
+				MouseEvent::ScrollDiscrete { x, y } => self.datamap.scroll = [x, y].into(),
+			}
+		}
+		let _ = self
+			.pointer
+			.set_datamap(self.datamap.serialize_pulse_data().as_slice());
+
+		Azimuth::handle_pointer_hit(self.pointer.alias());
+		let mut key_events = Vec::new();
+		while let Ok(key_event) = self.keyboard_event_rx.try_recv() {
+			key_events.push(key_event);
+		}
+		if !key_events.is_empty() {
+			Azimuth::handle_keyboard_send(
+				self.pointer.alias(),
+				self.keyboard_pulse_sender.node().alias(),
+				key_events,
+			);
+		}
+	}
+}
+
+struct DummyHandler;
+impl PulseSenderHandler for DummyHandler {
+	fn new_receiver(
+		&mut self,
+		_info: NewReceiverInfo,
+		_receiver: PulseReceiver,
+		_field: UnknownField,
+	) {
+	}
+
+	fn drop_receiver(&mut self, _uid: &str) {}
 }
